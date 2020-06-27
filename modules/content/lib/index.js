@@ -1,0 +1,221 @@
+const { join, resolve } = require('path')
+const fs = require('fs').promises
+const mkdirp = require('mkdirp')
+const defu = require('defu')
+
+const middleware = require('./middleware')
+const Database = require('./database')
+const WS = require('./ws')
+
+console.log('==========> Entramos en el index')
+
+const defaults = {
+  watch: false,
+  apiPrefix: '_content',
+  dir: 'content',
+  fullTextSearchFields: ['title', 'description', 'slug', 'text'],
+  nestedProperties: [],
+  markdown: {
+    basePlugins: [
+      'remark-squeeze-paragraphs',
+      'remark-slug',
+      'remark-autolink-headings',
+      'remark-external-links',
+      'remark-footnotes'
+    ],
+    plugins: [
+    ],
+    footnotes: {
+      inlineNotes: true
+    },
+    externalLinks: {},
+    prism: {
+      theme: 'prismjs/themes/prism.css'
+    }
+  },
+  yaml: {},
+  csv: {}
+}
+
+module.exports = async function () {
+  console.log('==========> Entramos en la funcion del index.js')
+  const isSSG =
+    this.options.dev === false &&
+    (this.options.target === 'static' || this.options._generate)
+  const options = defu(
+    {
+      watch: this.options.dev,
+      ...this.options.content
+    },
+    defaults
+  )
+
+  console.log('==========> Antes del resolve')
+
+  options.dir = resolve(this.options.srcDir, options.dir)
+
+  console.log('==========> Después del resolve')
+
+  options.apiPrefixWithBase = options.apiPrefix
+  if (this.options.router.base) {
+    let baseRouter = this.options.router.base
+
+    if (baseRouter[0] === '/') {
+      baseRouter = baseRouter.substring(1)
+    }
+
+    options.apiPrefixWithBase = baseRouter + options.apiPrefix
+  }
+
+  const ws = new WS({
+    apiPrefix: options.apiPrefixWithBase
+  })
+  this.nuxt.hook('listen', (server) => {
+    server.on('upgrade', (...args) => ws.callHook('upgrade', ...args))
+  })
+
+  const database = new Database({
+    ...options,
+    cwd: this.options.srcDir
+  })
+
+  // Database hooks
+  database.hook('file:beforeInsert', item => this.nuxt.callHook('content:file:beforeInsert', item))
+  database.hook('file:updated', event => ws.broadcast(event))
+
+  // Initialize database from file system
+  await database.init()
+
+  // close database when Nuxt closes
+  this.nuxt.hook('close', () => database.close())
+  // listen to nuxt server to updrag
+
+  const $content = function () {
+    let options
+    const paths = []
+    Array.from(arguments).forEach((argument) => {
+      if (typeof argument === 'string') {
+        paths.push(argument)
+      } else if (typeof argument === 'object') {
+        options = argument
+      }
+    })
+
+    const path = paths.join('/').replace(/\/+/g, '/').replace(/^\//, '')
+
+    return database.query(`/${path}`, options)
+  }
+  module.exports.$content = $content
+  // Add $content reference to ssrContext
+  this.nuxt.hook('vue-renderer:context', (ssrContext) => {
+    ssrContext.$content = $content
+  })
+
+  // Add prism theme
+  if (options.markdown.prism.theme) {
+    this.nuxt.options.css.push(options.markdown.prism.theme)
+  }
+
+  console.log('==========> Cargamos el middleware')
+
+  // Add content server middleware
+  this.addServerMiddleware({
+    path: options.apiPrefix,
+    handler: middleware({ ws, database })
+  })
+
+  console.log('==========> Cargamos el plugin de servidor')
+
+  // Add server plugin
+  this.addPlugin({
+    fileName: 'content/plugin.server.js',
+    src: join(__dirname, 'templates/plugin.server.js')
+  })
+
+  /* istanbul ignore if */
+  if (isSSG) {
+    console.log('==========> Entramos en el IF isSSG')
+
+    // Write db.json
+    this.nuxt.hook('generate:distRemoved', async () => {
+      const dir = resolve(this.options.buildDir, 'dist', 'client', 'content')
+
+      await mkdirp(dir)
+      await fs.writeFile(join(dir, 'db.json'), database.db.serialize(), 'utf-8')
+    })
+
+    // Add client plugin
+    this.addTemplate({
+      fileName: 'content/plugin.client.lazy.js',
+      src: join(__dirname, 'templates/plugin.static.lazy.js'),
+      options: {
+        fullTextSearchFields: options.fullTextSearchFields,
+        dirs: database.dirs
+      }
+    })
+    let publicPath = this.options.build.publicPath // can be an url
+    let routerBasePath = this.options.router.base
+
+    /* istanbul ignore if */
+    if (publicPath[publicPath.length - 1] !== '/') {
+      publicPath += '/'
+    }
+    if (routerBasePath[routerBasePath.length - 1] === '/') {
+      routerBasePath = routerBasePath.slice(0, -1)
+    }
+
+    console.log('==========> Cargamos el plugin de cliente')
+
+    this.addPlugin({
+      fileName: 'content/plugin.client.js',
+      src: join(__dirname, 'templates/plugin.static.js'),
+      options: {
+        // if publicPath is an URL, use public path, if not, add basepath before it
+        dbPath: isUrl(publicPath) ? `${publicPath}content/db.json` : `${routerBasePath}${publicPath}content/db.json`
+      }
+    })
+  } else {
+    console.log('==========> Entramos en el ELSE')
+
+    console.log('==========> Cargamos el plugin de cliente')
+
+    this.addPlugin({
+      fileName: 'content/plugin.client.js',
+      src: join(__dirname, 'templates/plugin.client.js'),
+      options: {
+        apiPrefix: options.apiPrefixWithBase,
+        watch: options.watch
+      }
+    })
+  }
+
+  // Add client plugin QueryBuilder
+  this.addTemplate({
+    fileName: 'content/query-builder.js',
+    src: join(
+      __dirname,
+      isSSG ? 'query-builder.js' : 'templates/query-builder.js'
+    )
+  })
+
+  console.log('==========> Cargamos el script nuxt-content.js')
+
+  // Add client plugin component
+  this.addTemplate({
+    fileName: 'content/nuxt-content.js',
+    src: join(__dirname, 'templates/nuxt-content.js')
+  })
+  function isUrl (string) {
+    try {
+      // quick test if the string is an URL
+      // eslint-disable-next-line no-new
+      new URL(string)
+    } catch (_) {
+      return false
+    }
+    return true
+  }
+}
+
+module.exports.Database = Database
+module.exports.middleware = middleware
